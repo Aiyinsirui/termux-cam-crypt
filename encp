@@ -1,0 +1,122 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ============================================================
+#  encp - encrypt camera photos & videos of the last N minutes,
+#         delete the originals (no recycle bin), then purge the
+#         media-store cache and refresh the gallery.
+#
+#  Author : Operit
+#  Usage  : ./encp
+#  Env    : WINDOW_MIN  minutes to look back (default 10)
+# ============================================================
+set -u
+
+SRC_DIR="/sdcard/DCIM/Camera"
+DST_DIR="/sdcard/encryptpho"
+PASS_FILE="$HOME/.aes_pass"
+WINDOW_MIN="${WINDOW_MIN:-10}"
+ENC_EXT="enc"
+
+log(){  echo -e "\033[36m[encp]\033[0m $*"; }
+ok(){   echo -e "\033[32m[ OK ]\033[0m $*"; }
+warn(){ echo -e "\033[33m[WARN]\033[0m $*"; }
+err(){  echo -e "\033[31m[FAIL]\033[0m $*"; }
+
+[ -d "$SRC_DIR" ]   || { err "no camera dir: $SRC_DIR"; exit 1; }
+command -v openssl >/dev/null 2>&1 || { err "openssl missing"; exit 1; }
+[ -f "$PASS_FILE" ] || { err "password file missing: $PASS_FILE"; exit 1; }
+PASSWORD=$(head -n 1 "$PASS_FILE" | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//")
+[ -n "$PASSWORD" ] || { err "empty password in $PASS_FILE"; exit 1; }
+mkdir -p "$DST_DIR" || { err "cannot mkdir $DST_DIR"; exit 1; }
+
+NOW=$(date +%s); CUTOFF=$(( NOW - WINDOW_MIN*60 ))
+log "now: $(date '+%Y-%m-%d %H:%M:%S')"
+log "window: last $WINDOW_MIN min"
+
+TMPLIST=$(mktemp)
+find "$SRC_DIR" -maxdepth 2 -type f \( \
+    -iname "*.jpg"  -o -iname "*.jpeg" -o -iname "*.png"  -o -iname "*.heic" -o -iname "*.heif" -o \
+    -iname "*.webp" -o -iname "*.dng"  -o -iname "*.gif"  -o -iname "*.bmp"  -o \
+    -iname "*.mp4"  -o -iname "*.mov"  -o -iname "*.mkv"  -o -iname "*.avi"  -o -iname "*.3gp"  -o \
+    -iname "*.m4v"  -o -iname "*.webm" -o -iname "*.ts"   -o -iname "*.flv"  -o -iname "*.wmv" \
+  \) -newermt "@$CUTOFF" 2>/dev/null > "$TMPLIST"
+
+COUNT=$(wc -l < "$TMPLIST" | tr -d " ")
+if [ "$COUNT" -eq 0 ]; then
+  warn "no new photos/videos in last $WINDOW_MIN min"
+  rm -f "$TMPLIST"
+  exit 0
+fi
+log "found $COUNT file(s), encrypting..."
+
+SUCCESS=0; FAILED=0; DELETED=0; DELFAIL=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  base=$(basename "$f"); out="$DST_DIR/${base}.${ENC_EXT}"
+  if openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -in "$f" -out "$out" -pass pass:"$PASSWORD" 2>/dev/null; then
+    os=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+    ds=$(openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$out" -pass pass:"$PASSWORD" 2>/dev/null | sha256sum | awk '{print $1}')
+    if [ "$os" != "$ds" ]; then
+      err "verify failed: $base"; rm -f "$out"; FAILED=$((FAILED+1)); continue
+    fi
+    ok "encrypted: $base"
+    if command -v shred >/dev/null 2>&1; then shred -u -n 1 "$f" 2>/dev/null || rm -f "$f"; else rm -f "$f"; fi
+    if [ ! -e "$f" ]; then DELETED=$((DELETED+1)); log "  deleted: $base"; else warn "  delete failed: $base"; DELFAIL=$((DELFAIL+1)); fi
+    SUCCESS=$((SUCCESS+1))
+  else
+    err "encrypt failed: $base"; rm -f "$out"; FAILED=$((FAILED+1))
+  fi
+done < "$TMPLIST"
+rm -f "$TMPLIST"
+echo
+log "========== encrypt done =========="
+ok "encrypted: $SUCCESS"
+ok "deleted:   $DELETED"
+[ "$DELFAIL" -gt 0 ] && warn "delete failed: $DELFAIL"
+[ "$FAILED"  -gt 0 ] && err  "failed:        $FAILED"
+log "output: $DST_DIR"
+
+# ------------------------------------------------------------
+# Media-store cache purge + gallery refresh
+# ------------------------------------------------------------
+log "cleaning media-store cache & refreshing gallery..."
+
+# Helper used to run a privileged command through su / sudo / shizuku.
+run_priv(){
+  if command -v su >/dev/null 2>&1; then su -c "$1" 2>/dev/null && return 0; fi
+  if command -v sudo >/dev/null 2>&1; then sudo -n sh -c "$1" 2>/dev/null && return 0; fi
+  if command -v rish >/dev/null 2>&1; then rish -c "$1" 2>/dev/null && return 0; fi
+  return 1
+}
+
+# 1) Ask MediaProvider to drop stale records for the files we just removed,
+#    then rescan the volume so the gallery rebuilds its thumbnails.
+PURGED=0
+if run_priv "content delete --uri content://media/external/images/media --where \"_data LIKE '$SRC_DIR/%'\"" ; then PURGED=1; fi
+if run_priv "content delete --uri content://media/external/video/media  --where \"_data LIKE '$SRC_DIR/%'\"" ; then PURGED=1; fi
+if run_priv "content call --uri content://media --method scan_volume --arg external_primary" ; then
+  ok "media store purged & volume rescanned"
+  REFRESHED=1
+else
+  REFRESHED=0
+fi
+
+# 2) Fallback: legacy MEDIA_SCANNER broadcast (works on older devices).
+if [ "$REFRESHED" -ne 1 ]; then
+  if command -v am >/dev/null 2>&1; then
+    am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://$SRC_DIR" >/dev/null 2>&1 \
+      && { warn "legacy medias-canner broadcast sent (may be ignored on Android 11+)"; REFRESHED=2; }
+  fi
+fi
+
+# 3) Fallback: Termux:API media-scan (if the addon is installed).
+if [ "$REFRESHED" -eq 0 ]; then
+  if command -v termux-media-scan >/dev/null 2>&1; then
+    termux-media-scan -r "$SRC_DIR" >/dev/null 2>&1 && { ok "refreshed via termux-api"; REFRESHED=3; }
+  fi
+fi
+
+if [ "$REFRESHED" -eq 0 ]; then
+  warn "could not refresh media store automatically."
+  warn "install one of: root (su), Termux:API, or grant Shizuku."
+fi
+exit 0
