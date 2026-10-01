@@ -1,0 +1,64 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ============================================================
+#  decp - decrypt encrypted photos & videos of the last N
+#         minutes into /sdcard/encryptpho/decrypho/ (overwrite).
+#
+#  Author : Operit
+#  Usage  : ./decp
+#  Env    : WINDOW_MIN  minutes to look back (default 10)
+# ============================================================
+set -u
+
+SRC_DIR="/sdcard/encryptpho"
+DST_DIR="/sdcard/encryptpho/decrypho"
+PASS_FILE="$HOME/.aes_pass"
+WINDOW_MIN="${WINDOW_MIN:-10}"
+ENC_EXT="enc"
+
+log(){  echo -e "\033[36m[decp]\033[0m $*"; }
+ok(){   echo -e "\033[32m[ OK ]\033[0m $*"; }
+warn(){ echo -e "\033[33m[WARN]\033[0m $*"; }
+err(){  echo -e "\033[31m[FAIL]\033[0m $*"; }
+
+[ -d "$SRC_DIR" ]   || { err "no encrypt dir: $SRC_DIR"; exit 1; }
+command -v openssl >/dev/null 2>&1 || { err "openssl missing"; exit 1; }
+[ -f "$PASS_FILE" ] || { err "password file missing: $PASS_FILE"; exit 1; }
+PASSWORD=$(head -n 1 "$PASS_FILE" | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//")
+[ -n "$PASSWORD" ] || { err "empty password in $PASS_FILE"; exit 1; }
+mkdir -p "$DST_DIR" || { err "cannot mkdir $DST_DIR"; exit 1; }
+
+NOW=$(date +%s); CUTOFF=$(( NOW - WINDOW_MIN*60 ))
+log "now: $(date '+%Y-%m-%d %H:%M:%S')"
+log "window: last $WINDOW_MIN min"
+
+TMPLIST=$(mktemp)
+find "$SRC_DIR" -maxdepth 1 -type f -iname "*.${ENC_EXT}" -newermt "@$CUTOFF" 2>/dev/null > "$TMPLIST"
+
+COUNT=$(wc -l < "$TMPLIST" | tr -d " ")
+if [ "$COUNT" -eq 0 ]; then
+  warn "no encrypted files in last $WINDOW_MIN min"
+  rm -f "$TMPLIST"
+  exit 0
+fi
+log "found $COUNT encrypted file(s), decrypting..."
+
+SUCCESS=0; FAILED=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  base=$(basename "$f"); orig="${base%.${ENC_EXT}}"; out="$DST_DIR/$orig"
+  if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$f" -out "$out" -pass pass:"$PASSWORD" 2>/dev/null; then
+    ok "decrypted: $base -> $orig"
+    SUCCESS=$((SUCCESS+1))
+  else
+    err "decrypt failed (wrong password or corrupt): $base"
+    rm -f "$out"
+    FAILED=$((FAILED+1))
+  fi
+done < "$TMPLIST"
+rm -f "$TMPLIST"
+echo
+log "========== decrypt done =========="
+ok "decrypted: $SUCCESS"
+[ "$FAILED" -gt 0 ] && err "failed:    $FAILED"
+log "output: $DST_DIR"
+exit 0
